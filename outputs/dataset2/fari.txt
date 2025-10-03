@@ -1,0 +1,2 @@
+FARI_vs_true=0.873340
+FARI_vs_init=0.817673
