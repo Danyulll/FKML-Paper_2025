@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=2D Gaussian C=2 (2)
+#SBATCH --job-name=2D-Gaussian-C-2-(2)
 #SBATCH --account=def-thompsjr   # <-- change this
 #SBATCH --time=48:00:00
 #SBATCH --nodes=1

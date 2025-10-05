@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=big dataset
+#SBATCH --job-name=big-dataset
 #SBATCH --account=def-thompsjr   # <-- change this
 #SBATCH --time=48:00:00
 #SBATCH --nodes=1

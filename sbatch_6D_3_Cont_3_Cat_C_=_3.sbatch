@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=6D 3 Cont 3 Cat C = 3
+#SBATCH --job-name=6D-3-Cont-3-Cat-C-3
 #SBATCH --account=def-thompsjr   # <-- change this
 #SBATCH --time=48:00:00
 #SBATCH --nodes=1
