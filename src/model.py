@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
-# rl_ga_kdss_fcm_infer.py
-# Inference-only: load a trained DDQN agent, run KDSS-FCM+GA on a new dataset,
-# save final FARI score and clustering plots as PNGs.
-# Requires: numpy, pandas, torch, matplotlib, tqdm, scipy (scipy not strictly used)
+"""
+Shared Model Components for DDQN-based KDSS-FCM
+
+This module contains all the shared model code used by both train.py and test.py:
+- PyTorch device management
+- Data preprocessing utilities
+- Kernel density functions
+- FCM clustering algorithms
+- Genetic algorithm components
+- DDQN agent implementation
+- Reward system and state management
+"""
 
 import os
 import sys
 import math
-import argparse
 import random
 from collections import deque
 from itertools import combinations
 
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (enables 3D projection)
+
+# Import the RL metrics logger
+from rl_metrics import MetricsLogger
 
 # -------------------------
 # PyTorch (for DDQN)
@@ -55,7 +63,7 @@ def parse_index_list(s):
 
 def infer_column_types(df: pd.DataFrame):
     """
-    Heuristic (only used if you don't pass --con_idx/--fac_idx/--ord_idx):
+    Heuristic:
       - float columns -> continuous
       - int columns with <= 12 unique values -> ordinal
       - object/category -> nominal
@@ -82,7 +90,7 @@ def encode_mixed_df(df: pd.DataFrame, fac_idx=None, ord_idx=None) -> pd.DataFram
       - fac_idx (nominal): converted to unordered categorical codes.
       - ord_idx (ordinal): converted to ordered categorical codes (numeric sort if possible, else lexical), then to codes.
       - Any remaining non-numeric columns: treated as nominal and coded.
-    Returns a numeric DataFrame (ints/floats).
+    Returns a numeric DataFrame (ints/floats) suitable for distance computations.
     """
     df2 = df.copy()
     n_cols = df2.shape[1]
@@ -90,7 +98,7 @@ def encode_mixed_df(df: pd.DataFrame, fac_idx=None, ord_idx=None) -> pd.DataFram
     fac_idx = [] if fac_idx is None else list(fac_idx)
     ord_idx = [] if ord_idx is None else list(ord_idx)
 
-    # 1) Nominal (unordered)
+    # 1) Handle nominal (unordered categorical)
     for j in fac_idx:
         s = df2.iloc[:, j]
         if not isinstance(s.dtype, pd.CategoricalDtype):
@@ -98,37 +106,82 @@ def encode_mixed_df(df: pd.DataFrame, fac_idx=None, ord_idx=None) -> pd.DataFram
         s = s.cat.as_unordered()
         df2.iloc[:, j] = s.cat.codes.astype("int64")
 
-    # 2) Ordinal (ordered)
+    # 2) Handle ordinal (ordered categorical)
     for j in ord_idx:
         s = df2.iloc[:, j]
         if isinstance(s.dtype, pd.CategoricalDtype):
             s = s.cat.as_ordered()
             df2.iloc[:, j] = pd.Series(s).cat.codes.astype("int64")
         else:
+            # Try numeric ordering first
             try:
                 vals = pd.to_numeric(s, errors="raise")
                 cats = np.unique(vals.dropna())
+                # Use string categories to be robust to mixed types while preserving order
                 cat_strings = [str(c) for c in np.sort(cats)]
                 s_str = s.astype(str)
                 s_ord = pd.Categorical(s_str, categories=cat_strings, ordered=True)
                 df2.iloc[:, j] = pd.Series(s_ord).cat.codes.astype("int64")
             except Exception:
+                # Fallback to lexical ordering
                 cats = sorted(s.astype(str).dropna().unique())
                 s_ord = pd.Categorical(s.astype(str), categories=cats, ordered=True)
                 df2.iloc[:, j] = pd.Series(s_ord).cat.codes.astype("int64")
 
-    # 3) Remaining non-numeric -> nominal codes
+    # 3) Remaining columns: if still non-numeric, treat as nominal codes
     for j in range(n_cols):
         s = df2.iloc[:, j]
         if not pd.api.types.is_numeric_dtype(s):
             s = s.astype("category")
             df2.iloc[:, j] = s.cat.codes.astype("int64")
 
-    # 4) Ensure numeric
+    # 4) Ensure numeric dtype across the board
     for col in df2.columns:
         df2[col] = pd.to_numeric(df2[col], errors="coerce")
 
     return df2
+
+# -------------------------
+# Categorical cardinalities (for nominal/ordinal kernels)
+# -------------------------
+CAT_CARD = None  # np.ndarray of length D with per-column unique counts
+
+def set_categorical_cardinalities(X: np.ndarray, fac_idx=None, ord_idx=None):
+    """
+    Precompute per-column cardinalities from the FULL encoded dataset X.
+    Only nominal/ordinal columns matter; others are left as 1.
+    """
+    global CAT_CARD
+    D = X.shape[1]
+    card = np.ones(D, dtype=int)
+    for j in (fac_idx or []):
+        card[j] = int(len(np.unique(X[:, j])))
+    for j in (ord_idx or []):
+        card[j] = int(len(np.unique(X[:, j])))
+    CAT_CARD = card
+
+def make_aligned_bandwidths(D, con_idx=None, fac_idx=None, ord_idx=None):
+    """
+    Create a length-D bandwidth vector aligned to original columns:
+      - continuous j in con_idx:    U(0.1, 100.0)
+      - nominal j in fac_idx:       U(0.0, 1.0)
+      - ordinal j in ord_idx:       U(0.0, 1.0)
+      - anything else:              U(0.1, 10.0)
+    """
+    con_idx = [] if con_idx is None else list(con_idx)
+    fac_idx = [] if fac_idx is None else list(fac_idx)
+    ord_idx = [] if ord_idx is None else list(ord_idx)
+
+    bw = np.empty(D, dtype=float)
+    for j in range(D):
+        if j in con_idx:
+            bw[j] = np.random.uniform(0.1, 100.0)
+        elif j in fac_idx or j in ord_idx:
+            bw[j] = np.random.uniform(0.0, 1.0)
+        else:
+            bw[j] = np.random.uniform(0.1, 10.0)
+    return bw
+
 
 # -------------------------
 # FARI (Adjusted Fuzzy Rand Index)
@@ -203,16 +256,21 @@ def c_silverman(A, B, bws, Cmatrix_unused):
     return np.sum((1.0 / bws) * 0.5 * np.exp(-z) * np.sin(z + np.pi / 4.0))
 
 # Unordered categorical kernels
-def u_aitchisonaitken(A, B, bws, Cfull):
+def u_aitchisonaitken(A, B, bws, card_subset):
+    """
+    Aitchison–Aitken nominal kernel using correct per-feature category counts.
+    card_subset must be an array of same length as A/B/bws giving K_j for each feature.
+    """
     res = 0.0
     m = len(A)
     for j in range(m):
-        unique_count = len(np.unique(Cfull[:, j]))
-        if unique_count <= 1:
+        K = int(card_subset[j]) if card_subset is not None else 2
+        if K <= 1:
             res += (1 - bws[j])
         else:
-            res += (1 - bws[j]) if A[j] == B[j] else bws[j] / (unique_count - 1)
+            res += (1 - bws[j]) if A[j] == B[j] else bws[j] / (K - 1)
     return res
+
 
 def u_aitken(A, B, bws, Cfull):
     res = 0.0
@@ -268,13 +326,23 @@ def dkss_distance(x, c, bw,
     ck, uk, ok = _select_kernel()
     c_fun = ck[cFUN]; u_fun = uk[uFUN]; o_fun = ok[oFUN]
 
-    def compute(FUN, idx):
+    def compute(FUN, idx, kind):
         if len(idx) == 0: return 0.0
         a = x[idx]; b = c[idx]; bws = bw[idx]
-        full = np.vstack([x, c])[:, idx]  # small "full" matrix (2 x |idx|)
-        return FUN(a, a, bws, full) + FUN(b, b, bws, full) - FUN(a, b, bws, full) - FUN(b, a, bws, full)
+        # For nominal features, pass the correct per-feature cardinalities (K_j) sliced to idx
+        aux = None
+        if kind == "nominal":
+            # CAT_CARD is a length-D vector; slice it to the idx subset
+            aux = CAT_CARD[idx] if CAT_CARD is not None else None
+        # Continuous and ordinal kernels ignore the 4th arg
+        return FUN(a, a, bws, aux) + FUN(b, b, bws, aux) - FUN(a, b, bws, aux) - FUN(b, a, bws, aux)
 
-    return float(compute(c_fun, con_idx) + compute(u_fun, fac_idx) + compute(o_fun, ord_idx))
+    return float(
+        compute(c_fun, con_idx, "continuous")
+      + compute(u_fun, fac_idx, "nominal")
+      + compute(o_fun, ord_idx, "ordinal")
+    )
+
 
 # -------------------------
 # FCM inner loop (no bw update) used inside GA objective
@@ -371,7 +439,9 @@ def mutate(individual, p_m, sigma, con_idx, fac_idx, ord_idx):
 
 def genetic_algorithm(pop_size, num_generations, bandwidth_length, p_m, p_c, tournament_size, sigma,
                       U_ref, X, C, m, con_idx, fac_idx, ord_idx,
-                      verbose=False, initial_bw=None, max_iter_obj=1):
+                      verbose=False, initial_bw=None, max_iter_obj=1, show_progress=True):
+    from tqdm import tqdm
+    
     population = []
     for _ in range(pop_size):
         cand = []
@@ -388,7 +458,14 @@ def genetic_algorithm(pop_size, num_generations, bandwidth_length, p_m, p_c, tou
     best_fit = float('inf')
     prev_gen_best = float('inf')
 
-    for gen in range(num_generations):
+    # Create progress bar for GA generations
+    if show_progress:
+        ga_pbar = tqdm(range(num_generations), desc="Genetic Algorithm", unit="gen", 
+                      bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
+    else:
+        ga_pbar = range(num_generations)
+
+    for gen in ga_pbar:
         gen_best_fit = float('inf'); gen_best = None
         fits = []
         for ind in population:
@@ -401,6 +478,17 @@ def genetic_algorithm(pop_size, num_generations, bandwidth_length, p_m, p_c, tou
             if f < best_fit:
                 best_fit, best = f, ind
 
+        # Update progress bar with current metrics
+        if show_progress:
+            div = compute_diversity(population)
+            imp = 0 if prev_gen_best==float('inf') else (prev_gen_best - gen_best_fit)
+            ga_pbar.set_postfix({
+                'Best': f'{gen_best_fit:.4f}',
+                'Avg': f'{np.mean(fits):.4f}',
+                'Div': f'{div:.3f}',
+                'Imp': f'{imp:.4f}'
+            })
+        
         if verbose:
             div = compute_diversity(population)
             imp = 0 if prev_gen_best==float('inf') else (prev_gen_best - gen_best_fit)
@@ -420,13 +508,24 @@ def genetic_algorithm(pop_size, num_generations, bandwidth_length, p_m, p_c, tou
             new_pop.extend([clamp_continuous(c1, con_idx), clamp_continuous(c2, con_idx)])
         population = new_pop[:pop_size]
 
+    if show_progress:
+        ga_pbar.close()
+
     return best, best_fit, population
 
 # -------------------------
-# DDQN agent (device-aware) - INFERENCE ONLY
+# DDQN agent (device-aware)
 # -------------------------
 VHC="VHC"; HC="HC"; LC="LC"; STALLED="Stalled"; INCREASED="Increased"
 VHD="VHD"; HD="HD"; MD="MD"; LD="LD"; VLD="VLD"
+
+REWARD_TABLE = {
+    (VHC, VHD): 200,   (VHC, HD): 150,   (VHC, MD): 100,   (VHC, LD): 50,    (VHC, VLD): 25,
+    (HC,  VHD): 150,   (HC,  HD): 112.5, (HC,  MD): 75,    (HC,  LD): 37.5,  (HC,  VLD): 18.75,
+    (LC,  VHD): 100,   (LC,  HD): 75,    (LC,  MD): 50,    (LC,  LD): 25,    (LC,  VLD): 12.5,
+    (STALLED, VHD): 0, (STALLED, HD): 0, (STALLED, MD): -10, (STALLED, LD): -20, (STALLED, VLD): -30,
+    (INCREASED, VHD): -100, (INCREASED, HD): -150, (INCREASED, MD): -200, (INCREASED, LD): -250, (INCREASED, VLD): -300
+}
 
 def discretize_improvement(improvement):
     if improvement > 0.005: return VHC
@@ -469,13 +568,14 @@ class QNetwork(nn.Module):
 
 class DDQNAgent:
     def __init__(self, state_size=25, action_size=25, hidden_dims=[64,64],
-                 lr=1e-3, gamma=0.9, epsilon=0.0, epsilon_min=0.0, epsilon_decay=1.0,
+                 lr=1e-3, gamma=0.9, epsilon=1.0, epsilon_min=0.05, epsilon_decay=0.995,
                  buffer_size=10000, batch_size=32, target_update_freq=100, device=None):
         self.state_size=state_size; self.action_size=action_size
         self.gamma=gamma
         self.epsilon=epsilon; self.epsilon_min=epsilon_min; self.epsilon_decay=epsilon_decay
         self.batch_size=batch_size; self.target_update_freq=target_update_freq
         self.update_counter=0
+        self.global_step=0  # Add global step counter for metrics
         self.device = device or pick_device()
 
         self.online_net = QNetwork(state_size, hidden_dims, action_size).to(self.device)
@@ -485,6 +585,7 @@ class DDQNAgent:
         self.optimizer = optim.Adam(self.online_net.parameters(), lr=lr)
         self.replay = deque(maxlen=buffer_size)
 
+        # Debug: confirm model device
         print(f"[DDQN] Using device: {self.device} | param device: {next(self.online_net.parameters()).device}")
 
     def get_state(self, improvement, diversity):
@@ -494,16 +595,48 @@ class DDQNAgent:
         return onehot_from_index(state_to_index(state), self.state_size)
 
     def choose_action(self, state):
-        # Inference only: greedy
+        if random.random() < self.epsilon:
+            return random.randint(0, self.action_size-1)
         s = torch.from_numpy(self._encode(state)).unsqueeze(0).to(self.device)
         with torch.no_grad():
             q = self.online_net(s)
         return int(q.argmax(dim=1))
 
-    # No-op training hooks for inference
-    def store(self, *args, **kwargs): pass
-    def update_network(self, *args, **kwargs): pass
-    def step(self, *args, **kwargs): pass
+    def store(self, s,a,r,s2,done):
+        self.replay.append((s,a,r,s2,done))
+
+    def update_network(self, metrics_logger=None):
+        if len(self.replay) < self.batch_size: return
+        batch = random.sample(self.replay, self.batch_size)
+        S, A, R, S2, D = zip(*batch)
+        S  = torch.from_numpy(np.vstack([self._encode(s)  for s  in S ])).to(self.device)
+        S2 = torch.from_numpy(np.vstack([self._encode(s2) for s2 in S2])).to(self.device)
+        A  = torch.tensor(A, dtype=torch.long, device=self.device).unsqueeze(1)
+        R  = torch.tensor(R, dtype=torch.float32, device=self.device).unsqueeze(1)
+        D  = torch.tensor(D, dtype=torch.float32, device=self.device).unsqueeze(1)
+
+        Q  = self.online_net(S).gather(1, A)
+        next_a = self.online_net(S2).argmax(dim=1, keepdim=True)
+        Q2 = self.target_net(S2).gather(1, next_a)
+        target = R + self.gamma * Q2 * (1 - D)
+
+        loss = nn.MSELoss()(Q, target.detach())
+        self.optimizer.zero_grad(); loss.backward(); self.optimizer.step()
+
+        # Log TD loss for metrics
+        if metrics_logger:
+            metrics_logger.log_td_loss(self.global_step, loss.item())
+
+        self.update_counter += 1
+        self.global_step += 1
+        if self.update_counter % self.target_update_freq == 0:
+            self.target_net.load_state_dict(self.online_net.state_dict())
+
+        self.epsilon = max(self.epsilon_min, self.epsilon*self.epsilon_decay)
+
+    def step(self, s, a, r, s2, done=False, metrics_logger=None):
+        self.store(s,a,r,s2,done)
+        self.update_network(metrics_logger)
 
     def save(self, path):
         torch.save(self.online_net.state_dict(), path)
@@ -520,30 +653,119 @@ class DDQNAgent:
         return ok
 
 # -------------------------
-# RL wrapper around GA (Inference only: no agent updates)
+# RL wrapper around GA
 # -------------------------
-def estimate_bandwidth_vector_RL_infer(state, initial_bw, RL_agent,
-                                       U_ref, X, C, m, con_idx, fac_idx, ord_idx,
-                                       max_iter_obj=1, verbose=False):
+def estimate_bandwidth_vector_RL(state, initial_bw, RL_agent, prev_ga_obj,
+                                 U_ref, X, C, m, con_idx, fac_idx, ord_idx,
+                                 max_iter_obj=1, verbose=False, metrics_logger=None):
+    r_list = []
+
     action_idx = RL_agent.choose_action(state)
     p_m, p_c = index_to_action(action_idx)
     if verbose:
-        print(f"[DDQN] [INFER] state={state} -> action p_m={p_m:.2f}, p_c={p_c:.2f}")
+        print(f"[DDQN] state={state} -> action p_m={p_m:.2f}, p_c={p_c:.2f}")
+
+    # Log action for metrics
+    if metrics_logger:
+        metrics_logger.log_action(action_idx, state)
 
     best_bw, best_obj, final_pop = genetic_algorithm(
         pop_size=20, num_generations=10, bandwidth_length=len(initial_bw),
         p_m=p_m, p_c=p_c, tournament_size=3, sigma=5.0,
         U_ref=U_ref, X=X, C=C, m=m, con_idx=con_idx, fac_idx=fac_idx, ord_idx=ord_idx,
-        verbose=False, initial_bw=initial_bw, max_iter_obj=max_iter_obj
+        verbose=False, initial_bw=initial_bw, max_iter_obj=max_iter_obj, show_progress=False
     )
 
     diversity = compute_diversity(final_pop)
-    improvement = 0.0  # not tracked during inference
+    improvement = 0.0 if prev_ga_obj is None else (prev_ga_obj - best_obj)
     next_state = (discretize_improvement(improvement), discretize_diversity(diversity))
-    return best_bw, best_obj, next_state
+    reward = REWARD_TABLE[next_state]
+
+    RL_agent.step(state, action_idx, reward, next_state, done=False, metrics_logger=metrics_logger)
+    r_list.append(reward)
+
+    if verbose:
+        print(f"[DDQN] improvement={improvement:.6f} diversity={diversity:.4f} reward={reward}")
+
+    return best_bw, best_obj, r_list, next_state
+
+def train_RL_agent(X, initial_bw, RL_agent, prev_ga_obj, U_ref, C, m,
+                   con_idx, fac_idx, ord_idx, B=200, max_iter_obj=1,
+                   ckpt_dir="./checkpoints", verbose=False, show_progress=True):
+    from tqdm import tqdm
+    
+    ensure_dir(ckpt_dir)
+        # Initialize categorical cardinalities for nominal/ordinal kernels
+    set_categorical_cardinalities(X, fac_idx=fac_idx, ord_idx=ord_idx)
+
+    # Initialize metrics logger
+    metrics_logger = MetricsLogger(out_dir=os.path.join(ckpt_dir, "rl_metrics"))
+    
+    rewards_all = []
+    state = (STALLED, VLD)
+    bw_current = list(initial_bw)
+
+    # Create progress bar
+    if show_progress:
+        pbar = tqdm(range(B), desc="Training DDQN", unit="episode", 
+                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
+    else:
+        pbar = range(B)
+
+    for b in pbar:
+        bw_current, ga_obj, r_list, state = estimate_bandwidth_vector_RL(
+            state=state, initial_bw=bw_current, RL_agent=RL_agent, prev_ga_obj=prev_ga_obj,
+            U_ref=U_ref, X=X, C=C, m=m, con_idx=con_idx, fac_idx=fac_idx, ord_idx=ord_idx,
+            max_iter_obj=max_iter_obj, verbose=verbose, metrics_logger=metrics_logger
+        )
+        rewards_all.extend(r_list)
+        prev_ga_obj = ga_obj
+
+        # Log episode metrics
+        episode_reward = sum(r_list) if r_list else 0.0
+        metrics_logger.log_episode_reward(episode_reward)
+        metrics_logger.log_epsilon(b, RL_agent.epsilon)
+        metrics_logger.log_state(state)
+        
+        # Log Q-values and replay buffer stats periodically
+        if b % 10 == 0:  # Every 10 episodes
+            metrics_logger.log_q_values(RL_agent.global_step, RL_agent)
+            metrics_logger.log_replay(RL_agent)
+
+        # Update progress bar with current metrics
+        if show_progress and len(rewards_all) > 0:
+            avg_reward = np.mean(rewards_all[-10:])  # Last 10 rewards
+            cum_reward = np.sum(rewards_all)
+            pbar.set_postfix({
+                'Epsilon': f'{RL_agent.epsilon:.3f}',
+                'Avg Reward': f'{avg_reward:.2f}',
+                'Cum Reward': f'{cum_reward:.1f}'
+            })
+
+        if (b+1) % 50 == 0:
+            RL_agent.save(os.path.join(ckpt_dir, "ddqn_agent.pt"))
+
+    if show_progress:
+        pbar.close()
+
+    RL_agent.save(os.path.join(ckpt_dir, "ddqn_agent.pt"))
+    
+    # Generate all RL metrics plots
+    print(f"\n=== Generating RL Training Metrics ===")
+    metrics_logger.plot_all()
+    print(f"RL metrics plots saved to: {metrics_logger.out_dir}")
+
+    # Plot cumulative reward
+    plt.figure(figsize=(8,5))
+    plt.plot(np.cumsum(rewards_all), marker='o')
+    plt.title("Cumulative Reward during DDQN Training")
+    plt.xlabel("Episode"); plt.ylabel("Cumulative Reward"); plt.grid(True)
+    ensure_dir("./outputs"); plt.savefig("./outputs/ddqn_training_rewards.png", dpi=200, bbox_inches="tight"); plt.close()
+
+    return RL_agent, rewards_all
 
 # -------------------------
-# Full KDSS-FCM with RL-GA bandwidth search (Inference-only)
+# Full KDSS-FCM with RL-GA bandwidth search
 # -------------------------
 def centers_from_membership(X, U, m):
     C = U.shape[1]; D = X.shape[1]
@@ -555,9 +777,9 @@ def centers_from_membership(X, U, m):
         V[c] = num / max(den, 1e-12)
     return V
 
-def kdml_fcm_infer(X, C, m, epsilon, con_idx, fac_idx, ord_idx,
-                   U_init, max_iter=100, verbose=False,
-                   RL_agent=None, max_iter_obj=1):
+def kdml_fcm(X, C, m, epsilon, con_idx, fac_idx, ord_idx,
+             U_init, max_iter=100, verbose=False,
+             RL_agent=None, train_B=0, max_iter_obj=1, ckpt_dir="./checkpoints", show_fcm_progress=True):
     N, D = X.shape
 
     # Ensure lists
@@ -565,37 +787,61 @@ def kdml_fcm_infer(X, C, m, epsilon, con_idx, fac_idx, ord_idx,
     fac_idx = [] if fac_idx is None else list(fac_idx)
     ord_idx = [] if ord_idx is None else list(ord_idx)
 
+    # Precompute cardinalities for nominal/ordinal kernels
+    set_categorical_cardinalities(X, fac_idx=fac_idx, ord_idx=ord_idx)
+
+
     # Initialize fuzzy membership from provided init membership (normalize)
     U = np.asarray(U_init, dtype=float)
     U = U / np.clip(U.sum(axis=1, keepdims=True), 1e-12, None)
+    # Track clustering history per-iteration
+    U_history = [U.copy()]
 
     # Initialize centers from that membership
     V = centers_from_membership(X, U, m)
 
-    # Random start bandwidths per feature type (fallback to one-per-col if mismatch)
-    bw_current = [np.random.uniform(0.1,100) for _ in con_idx] \
-               + [np.random.uniform(0,1)   for _ in fac_idx] \
-               + [np.random.uniform(0,1)   for _ in ord_idx]
-    if len(bw_current) != D:
-        bw_current = [np.random.uniform(0.1, 10.0) for _ in range(D)]
-        con_idx = list(range(D)); fac_idx=[]; ord_idx=[]
+    # Random start bandwidths, aligned to original columns
+    bw_current = make_aligned_bandwidths(D, con_idx=con_idx, fac_idx=fac_idx, ord_idx=ord_idx)
 
+
+
+    # Train / init agent
     if RL_agent is None:
-        RL_agent = DDQNAgent(lr=1e-3, gamma=0.9, epsilon=0.0)  # greedy
+        RL_agent = DDQNAgent(lr=1e-3, gamma=0.9, epsilon=1.0)
 
+    if train_B and train_B > 0:
+        RL_agent, _ = train_RL_agent(
+            X=X, initial_bw=bw_current, RL_agent=RL_agent, prev_ga_obj=None,
+            U_ref=U, C=C, m=m, con_idx=con_idx, fac_idx=fac_idx, ord_idx=ord_idx,
+            B=train_B, max_iter_obj=max_iter_obj, ckpt_dir=ckpt_dir, verbose=verbose
+        )
+
+    # RL loop over FCM iterations
     J_prev = float('inf')
+    reward_history = []
     state = RL_agent.get_state(0.0, 1.0)  # start state
 
-    for it in range(max_iter):
+    # Create progress bar for FCM iterations (only if enabled)
+    from tqdm import tqdm
+    if show_fcm_progress:
+        fcm_pbar = tqdm(range(max_iter), desc="KDSS-FCM", unit="iter", 
+                       bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
+    else:
+        fcm_pbar = range(max_iter)
+
+    prev_ga_obj = None
+    for it in fcm_pbar:
         if verbose:
             print(f"\n[FCM] iter={it}")
 
-        # One RL-GA step to update bandwidth (no agent updates)
-        bw_current, ga_obj, state = estimate_bandwidth_vector_RL_infer(
-            state=state, initial_bw=bw_current, RL_agent=RL_agent,
+        # One RL-GA step to update bandwidth
+        bw_current, ga_obj, r_list, state = estimate_bandwidth_vector_RL(
+            state=state, initial_bw=bw_current, RL_agent=RL_agent, prev_ga_obj=prev_ga_obj,
             U_ref=U, X=X, C=C, m=m, con_idx=con_idx, fac_idx=fac_idx, ord_idx=ord_idx,
             max_iter_obj=max_iter_obj, verbose=verbose
         )
+        prev_ga_obj = ga_obj
+        reward_history.extend(r_list)
 
         # Update centers from current U
         V = centers_from_membership(X, U, m)
@@ -622,312 +868,35 @@ def kdml_fcm_infer(X, C, m, epsilon, con_idx, fac_idx, ord_idx,
                     U[i, c] = 1.0 / max(denom, 1e-12)
 
         J = np.sum((U ** m) * (Dmat ** 2))
+        # record clustering for this iteration
+        U_history.append(U.copy())
+        
+        # Update progress bar with current metrics (only if progress bar is active)
+        if show_fcm_progress:
+            fcm_pbar.set_postfix({
+                'J': f'{J:.4f}',
+                'ΔJ': f'{abs(J-J_prev):.2e}',
+                'Reward': f'{np.sum(reward_history):.1f}'
+            })
+        
         if verbose:
             print(f"[FCM] J={J:.6f}  Δ={abs(J-J_prev):.3e}  bw[0..3]={np.asarray(bw_current)[:3]}")
         if abs(J - J_prev) < epsilon:
             if verbose: print(f"[FCM] Converged at iter {it}")
+            if show_fcm_progress:
+                fcm_pbar.set_postfix({'Status': 'Converged'})
             break
         J_prev = J
 
-    return V, U, np.asarray(bw_current)
+    if show_fcm_progress:
+        fcm_pbar.close()
 
-# -------------------------
-# Plotting helpers (no PCA)
-# -------------------------
-def labels_from_U(U):
-    return U.argmax(axis=1)
+    # Plot cumulative reward
+    ensure_dir("./outputs")
+    plt.figure(figsize=(8,5))
+    plt.plot(np.cumsum(reward_history))
+    plt.title("Cumulative Reward during KDSS-FCM (DDQN-controlled)")
+    plt.xlabel("Iteration"); plt.ylabel("Cumulative Reward"); plt.grid(True)
+    plt.savefig("./outputs/fcm_cumulative_reward.png", dpi=200, bbox_inches="tight"); plt.close()
 
-def plot_2d_argmax(X, U, out_path, feature_names=None):
-    labels = labels_from_U(U)
-    plt.figure(figsize=(7,6))
-    sc = plt.scatter(X[:,0], X[:,1], c=labels, s=20, cmap='tab10')
-    plt.xlabel(feature_names[0] if feature_names else "x0")
-    plt.ylabel(feature_names[1] if feature_names else "x1")
-    plt.title("Clustering (argmax labels, 2D)")
-    plt.grid(True, alpha=0.2)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
-    plt.close()
-
-def plot_2d_fuzzy_rgb(X, U, out_path, feature_names=None):
-    C = U.shape[1]
-    if C >= 3:
-        rgb = U[:, :3]
-        rgb = rgb / (rgb.max(axis=0, keepdims=True) + 1e-12)
-    elif C == 2:
-        rgb = np.zeros((U.shape[0], 3))
-        rgb[:,0] = U[:,0]; rgb[:,1] = U[:,1]
-    else:
-        rgb = np.repeat(U, 3, axis=1)
-    rgb = np.clip(rgb, 0, 1)
-    plt.figure(figsize=(7,6))
-    plt.scatter(X[:,0], X[:,1], c=rgb, s=20)
-    plt.xlabel(feature_names[0] if feature_names else "x0")
-    plt.ylabel(feature_names[1] if feature_names else "x1")
-    plt.title("Fuzzy clustering (RGB memberships, 2D)")
-    plt.grid(True, alpha=0.2)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
-    plt.close()
-
-def plot_3d_argmax(X, U, out_path, feature_names=None):
-    labels = labels_from_U(U)
-    fig = plt.figure(figsize=(8,6))
-    ax = fig.add_subplot(111, projection='3d')
-    p = ax.scatter(X[:,0], X[:,1], X[:,2], c=labels, s=12, cmap='tab10', depthshade=True)
-    ax.set_xlabel(feature_names[0] if feature_names else "x0")
-    ax.set_ylabel(feature_names[1] if feature_names else "x1")
-    ax.set_zlabel(feature_names[2] if feature_names else "x2")
-    ax.set_title("Clustering (argmax labels, 3D)")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
-    plt.close()
-
-def plot_3d_fuzzy_rgb(X, U, out_path, feature_names=None):
-    C = U.shape[1]
-    if C >= 3:
-        rgb = U[:, :3]
-        rgb = rgb / (rgb.max(axis=0, keepdims=True) + 1e-12)
-    elif C == 2:
-        rgb = np.zeros((U.shape[0], 3))
-        rgb[:,0] = U[:,0]; rgb[:,1] = U[:,1]
-    else:
-        rgb = np.repeat(U, 3, axis=1)
-    rgb = np.clip(rgb, 0, 1)
-    fig = plt.figure(figsize=(8,6))
-    ax = fig.add_subplot(111, projection='3d')
-    ax.scatter(X[:,0], X[:,1], X[:,2], c=rgb, s=12, depthshade=True)
-    ax.set_xlabel(feature_names[0] if feature_names else "x0")
-    ax.set_ylabel(feature_names[1] if feature_names else "x1")
-    ax.set_zlabel(feature_names[2] if feature_names else "x2")
-    ax.set_title("Fuzzy clustering (RGB memberships, 3D)")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
-    plt.close()
-
-def plot_pairsplot_4d(X, U, out_path, feature_names=None):
-    """Scatter matrix (4x4) colored by argmax labels; diagonal are histograms per cluster."""
-    labels = labels_from_U(U)
-    k = 4
-    names = feature_names if (feature_names and len(feature_names) >= k) else [f"x{i}" for i in range(k)]
-    uniq = np.unique(labels)
-    cmap = plt.get_cmap('tab10')
-    colors = [cmap(int(u) % 10) for u in uniq]
-
-    fig, axes = plt.subplots(k, k, figsize=(12,12))
-    for i in range(k):
-        for j in range(k):
-            ax = axes[i, j]
-            if i == j:
-                # overlaid histograms by cluster
-                for u, col in zip(uniq, colors):
-                    ax.hist(X[labels==u, j], bins=30, alpha=0.5, color=col)
-                ax.set_ylabel("count")
-            else:
-                ax.scatter(X[:, j], X[:, i], c=labels, s=6, cmap='tab10')
-            if i == k-1:
-                ax.set_xlabel(names[j])
-            else:
-                ax.set_xticklabels([])
-            if j == 0:
-                ax.set_ylabel(names[i])
-            else:
-                ax.set_yticklabels([])
-    fig.suptitle("Pairsplot (4D) by cluster labels", y=0.93)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
-    plt.close()
-
-def plot_membership_heatmap(U, out_path):
-    # Sort rows by argmax for readability
-    order = np.argsort(U.argmax(axis=1))
-    U_sorted = U[order]
-    plt.figure(figsize=(8, max(4, U.shape[1])))
-    plt.imshow(U_sorted.T, aspect='auto', interpolation='nearest')
-    plt.colorbar(label='Membership')
-    plt.yticks(range(U.shape[1]), [f"Cluster {i}" for i in range(U.shape[1])])
-    plt.xlabel("Samples (sorted by argmax)"); plt.ylabel("Clusters")
-    plt.title("Membership matrix (heatmap)")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
-    plt.close()
-
-# -------------------------
-# Main
-# -------------------------
-def main():
-    parser = argparse.ArgumentParser(description="Inference-only KDSS-FCM with pre-trained DDQN agent")
-    parser.add_argument("--data_csv", type=str, required=True, help="Path to data CSV")
-    parser.add_argument("--init_membership_csv", type=str, required=True, help="Path to init membership CSV")
-    parser.add_argument("--true_post_csv", type=str, required=True, help="Path to true posterior CSV")
-    parser.add_argument("--agent_ckpt", type=str, required=True, help="Path to ddqn_agent.pt checkpoint")
-
-    parser.add_argument(
-        "--use_cols", type=str, default=None,
-        help="Comma-separated 0-based column indices to use from the data CSV (e.g., '0,1,2'). "
-             "If omitted, all columns are used."
-    )
-    parser.add_argument(
-        "--con_idx", type=str, default=None,
-        help="Comma-separated indices (relative to the USED columns) that are continuous."
-    )
-    parser.add_argument(
-        "--fac_idx", type=str, default=None,
-        help="Comma-separated indices (relative to the USED columns) that are NOMINAL (unordered categorical)."
-    )
-    parser.add_argument(
-        "--ord_idx", type=str, default=None,
-        help="Comma-separated indices (relative to the USED columns) that are ORDINAL (ordered categorical)."
-    )
-
-    parser.add_argument("--m", type=float, default=1.2)
-    parser.add_argument("--epsilon", type=float, default=1e-3)
-    parser.add_argument("--max_iters", type=int, default=100)
-    parser.add_argument("--max_iter_obj", type=int, default=1, help="Inner FCM lookahead for GA objective")
-    parser.add_argument("--outputs_dir", type=str, default="./outputs")
-    parser.add_argument("--verbose", action="store_true")
-    args = parser.parse_args()
-
-    ensure_dir(args.outputs_dir)
-
-    # 1) Load CSVs
-    df_full = pd.read_csv(args.data_csv)
-    if args.use_cols:
-        idxs = parse_index_list(args.use_cols)
-        df = df_full.iloc[:, idxs].copy()
-        feature_names = [df_full.columns[i] for i in idxs]
-        print(f"[Using columns] indices={idxs} -> names={feature_names}")
-    else:
-        df = df_full.copy()
-        feature_names = list(df_full.columns)
-
-    U_init = pd.read_csv(args.init_membership_csv).to_numpy(dtype=float)
-    U_true = pd.read_csv(args.true_post_csv).to_numpy(dtype=float)
-
-    print(f"Data shape (raw/used): {df_full.shape} / {df.shape}")
-    print(f"Init membership shape: {U_init.shape}")
-    print(f"True posterior shape : {U_true.shape}")
-
-    # 2) Indices for feature types (RELATIVE TO USED COLUMNS)
-    con_idx = parse_index_list(args.con_idx)
-    fac_idx = parse_index_list(args.fac_idx)
-    ord_idx = parse_index_list(args.ord_idx)
-    if con_idx is None and fac_idx is None and ord_idx is None:
-        con_idx, fac_idx, ord_idx = infer_column_types(df)
-        print(f"[Auto] con_idx={con_idx}, fac_idx={fac_idx}, ord_idx={ord_idx}")
-    else:
-        print(f"[Manual] con_idx={con_idx}, fac_idx={fac_idx}, ord_idx={ord_idx}")
-
-    # 3) Encode mixed dataframe -> numeric matrix for kernels
-    X = encode_mixed_df(df, fac_idx=fac_idx, ord_idx=ord_idx).to_numpy(dtype=float)
-
-    # 4) Shape checks / cluster count
-    n = X.shape[0]
-    if U_init.shape[0] != n or U_true.shape[0] != n:
-        raise ValueError(f"Row mismatch: data n={n}, init_U n={U_init.shape[0]}, true_post n={U_true.shape[0]}")
-    C = U_init.shape[1]
-    print(f"Inferred clusters C = {C}")
-
-    # 5) Load DDQN agent on device (greedy)
-    device = pick_device()
-    print(f"[System] Selected device: {device}")
-    agent = DDQNAgent(lr=1e-3, gamma=0.9, epsilon=0.0, device=device)  # epsilon=0.0 forces greedy
-    agent.assert_on_device()
-    agent.load(args.agent_ckpt)
-    print(f"[Agent] Loaded from {args.agent_ckpt}")
-
-    # Optional quick device check
-    s_test = torch.from_numpy(agent._encode(agent.get_state(0.0, 1.0))).unsqueeze(0).to(agent.device)
-    with torch.no_grad():
-        q_test = agent.online_net(s_test)
-    print("[Check] Q tensor device:", q_test.device)
-
-    # 6) Run KDSS-FCM (inference-only)
-    V_final, U_final, bw_final = kdml_fcm_infer(
-        X=X,
-        C=C,
-        m=args.m,
-        epsilon=args.epsilon,
-        con_idx=con_idx,
-        fac_idx=fac_idx,
-        ord_idx=ord_idx,
-        U_init=U_init,
-        max_iter=args.max_iters,
-        verbose=args.verbose,
-        RL_agent=agent,
-        max_iter_obj=args.max_iter_obj
-    )
-
-    # 7) Evaluate and persist numeric outputs
-    fari_vs_truth = fari(U_final, U_true)
-    fari_vs_init  = fari(U_final, U_init)
-    print("\n=== RESULTS (Inference) ===")
-    print(f"FARI(U_final, true_post) = {fari_vs_truth:.6f}")
-    print(f"FARI(U_final, init_U)    = {fari_vs_init:.6f}")
-    print(f"Final bandwidth (all): {np.asarray(bw_final)}")
-
-    np.savetxt(os.path.join(args.outputs_dir, "U_final.csv"), U_final, delimiter=",")
-    np.savetxt(os.path.join(args.outputs_dir, "V_final.csv"), V_final, delimiter=",")
-    np.savetxt(os.path.join(args.outputs_dir, "bw_final.csv"), np.asarray(bw_final), delimiter=",")
-    with open(os.path.join(args.outputs_dir, "fari.txt"), "w") as f:
-        f.write(f"FARI_vs_true={fari_vs_truth:.6f}\nFARI_vs_init={fari_vs_init:.6f}\n")
-    print(f"Saved: {args.outputs_dir}/U_final.csv, V_final.csv, bw_final.csv, fari.txt")
-
-    # 8) Plots (NO PCA):
-    D = X.shape[1]
-    # Use feature names of the used columns (helps axis labels)
-    names = feature_names
-
-    if D == 2:
-        plot_2d_argmax(
-            X, U_final,
-            out_path=os.path.join(args.outputs_dir, "clustering_argmax_2d.png"),
-            feature_names=names[:2]
-        )
-        plot_2d_fuzzy_rgb(
-            X, U_final,
-            out_path=os.path.join(args.outputs_dir, "clustering_fuzzy_rgb_2d.png"),
-            feature_names=names[:2]
-        )
-        print(f"Saved plots: {args.outputs_dir}/clustering_argmax_2d.png, clustering_fuzzy_rgb_2d.png")
-
-    elif D == 3:
-        plot_3d_argmax(
-            X, U_final,
-            out_path=os.path.join(args.outputs_dir, "clustering_argmax_3d.png"),
-            feature_names=names[:3]
-        )
-        plot_3d_fuzzy_rgb(
-            X, U_final,
-            out_path=os.path.join(args.outputs_dir, "clustering_fuzzy_rgb_3d.png"),
-            feature_names=names[:3]
-        )
-        print(f"Saved plots: {args.outputs_dir}/clustering_argmax_3d.png, clustering_fuzzy_rgb_3d.png")
-
-    elif D == 4:
-        plot_pairsplot_4d(
-            X, U_final,
-            out_path=os.path.join(args.outputs_dir, "clustering_pairsplot_4d.png"),
-            feature_names=names[:4]
-        )
-        print(f"Saved plot: {args.outputs_dir}/clustering_pairsplot_4d.png")
-
-    elif D > 4:
-        # Fallback: pairsplot of the first 4 features
-        print(f"[Note] Data has {D} dimensions; generating a pairsplot for the first 4 features only.")
-        plot_pairsplot_4d(
-            X[:, :4], U_final,
-            out_path=os.path.join(args.outputs_dir, "clustering_pairsplot_top4.png"),
-            feature_names=names[:4]
-        )
-        print(f"Saved plot: {args.outputs_dir}/clustering_pairsplot_top4.png")
-
-    # Membership heatmap (all cases)
-    plot_membership_heatmap(
-        U_final,
-        out_path=os.path.join(args.outputs_dir, "membership_heatmap.png")
-    )
-    print(f"Saved plot: {args.outputs_dir}/membership_heatmap.png")
-
-if __name__ == "__main__":
-    main()
+    return V, U, reward_history, np.asarray(bw_current), U_history

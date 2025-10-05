@@ -21,4 +21,4 @@ hostname
 nvidia-smi || true
 echo "======================= "
 
-python ./test.py --data_csv "./data/big dataset/bigdataset_data.csv" --init_membership_csv "./data/big dataset/bigdataset_membership.csv" --true_post_csv "./data/big dataset/bigdataset_membership.csv" --agent_ckpt "./ddqn_agent.pt" --use_cols "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14" --con_idx "0,1,2,3,4,5,6,10,11,12" --ord_idx "7,8,9,13,14" --outputs_dir "./outputs" --verbose
+ python3 ./src/test.py --data_csv "./data/2D Gaussian C=2 (2)/2D_G_mean_-2.5_2.5_sd_1_1_G_mean_3_3_sd_1.1_1.1.csv" --init_membership_csv "./data/2D Gaussian C=2 (2)/2D_G_mean_-2.5_2.5_sd_1_1_G_mean_3_3_sd_1.1_1.1_membership.csv" --true_post_csv "./data/2D Gaussian C=2 (2)/2D_G_mean_-2.5_2.5_sd_1_1_G_mean_3_3_sd_1.1_1.1_true_posterior.csv" --restarts 10 --outputs_dir "./outputs/dataset_2D_Gaussian_2" --verbose --con_idx "0,1" --use_cols "0,1" --con_idx "0,1"
