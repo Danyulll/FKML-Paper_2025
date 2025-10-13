@@ -175,7 +175,8 @@ def main():
     parser.add_argument("--outputs_dir", type=str, default="./outputs", help="Output directory")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument("--restarts", type=int, default=10, help="Number of KDSS-FCM restarts per m (keep best by FARI)")
-    parser.add_argument("--workers", type=int, default=None, help="Max worker processes for parallel runs (default: CPU count)")
+    parser.add_argument("--workers", type=int, default=None,
+        help="Max worker processes for parallel runs (default: 100)")
     
     args = parser.parse_args()
 
@@ -245,13 +246,29 @@ def main():
     
     # Parallel execution over (m, restart) pairs
     tasks = [(float(m), int(r)) for m in m_values for r in range(args.restarts)]
-    max_workers = args.workers or os.cpu_count() or 1
+    # Default to using 100 workers unless explicitly overridden.
+    requested_workers = int(max(1, args.workers)) if args.workers is not None else 100
+    max_workers = min(requested_workers, len(tasks))
+
     print(f"[Parallel] Initializing {max_workers} workers for {len(tasks)} tasks (m-values x restarts)")
     results_by_m = {float(m): [] for m in m_values}
 
-    with ProcessPoolExecutor(max_workers=max_workers,
-                             initializer=_worker_init,
-                             initargs=(X, C, con_idx, fac_idx, ord_idx, U_init, U_true, args.epsilon, args.max_iter_obj, args.agent_path)) as ex:
+    with ProcessPoolExecutor(
+        max_workers=max_workers,
+        initializer=_worker_init,
+        initargs=(
+            X,
+            C,
+            con_idx,
+            fac_idx,
+            ord_idx,
+            U_init,
+            U_true,
+            args.epsilon,
+            args.max_iter_obj,
+            args.agent_path,
+        ),
+    ) as ex:
         futures = {ex.submit(_run_single_restart, t): t for t in tasks}
         for _ in tqdm(_fut.as_completed(futures), total=len(futures), desc="Parallel runs"):
             pass
