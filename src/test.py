@@ -54,6 +54,52 @@ _CTX = {
 }
 
 
+def _parse_workers_arg(value: str | None) -> str | int:
+    """Normalize the --workers argument into a canonical token or integer.
+
+    Accepted values (case-insensitive):
+        - "auto" / "default" -> keep conservative cap (min(8, CPU count))
+        - "cpu" / "cores"    -> use os.cpu_count()
+        - "mc" / "mc_runs"    -> use the number of Monte Carlo repetitions
+        - "tasks" / "all"     -> use the total tasks in the grid (m-values x restarts)
+        - positive integers    -> explicit worker count
+
+    The return value is either one of the string tokens above ("auto", "cpu",
+    "mc", "tasks") or a positive integer requested by the user.  Any other
+    value raises ``argparse.ArgumentTypeError`` so argparse can display a
+    helpful usage message.
+    """
+
+    if value is None:
+        return "auto"
+
+    value = str(value).strip()
+    if not value:
+        return "auto"
+
+    lowered = value.lower()
+    if lowered in {"auto", "default"}:
+        return "auto"
+    if lowered in {"cpu", "cores"}:
+        return "cpu"
+    if lowered in {"mc", "mc_runs", "per_mc"}:
+        return "mc"
+    if lowered in {"tasks", "all"}:
+        return "tasks"
+
+    try:
+        workers_int = int(value)
+    except ValueError as exc:  # pragma: no cover - defensive
+        raise argparse.ArgumentTypeError(
+            "--workers must be an integer, 'auto', 'cpu', 'mc', or 'tasks'"
+        ) from exc
+
+    if workers_int < 1:
+        raise argparse.ArgumentTypeError("--workers must be at least 1")
+
+    return workers_int
+
+
 def _worker_init(X, C, con_idx, fac_idx, ord_idx, U_init, U_true, epsilon, max_iter_obj, agent_path):
     # Initialize heavy globals once per process
     _CTX['X'] = X
@@ -175,8 +221,16 @@ def main():
     parser.add_argument("--outputs_dir", type=str, default="./outputs", help="Output directory")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument("--restarts", type=int, default=10, help="Number of KDSS-FCM restarts per m (keep best by FARI)")
-    parser.add_argument("--workers", type=int, default=None,
-        help="Max worker processes for parallel runs (default: 100)")
+    parser.add_argument(
+        "--workers",
+        type=_parse_workers_arg,
+        default="auto",
+        help=(
+            "Max worker processes for parallel runs. Accepts a positive integer, "
+            "'auto' (min(8, CPU count)), 'cpu' (one per hardware thread), 'mc' "
+            "(one per Monte Carlo run), or 'tasks' (one per restart/m-value task)."
+        ),
+    )
     parser.add_argument("--mc_runs", type=int, default=100,
         help="Number of Monte Carlo repetitions of the entire m-grid search (default: 100)")
     
@@ -259,10 +313,10 @@ def main():
     # by the CPU count and a small upper bound (8) which keeps memory usage reasonable
     # while still providing parallelism.  Users can still override this with --workers if
     # they have sufficient resources.
-    if args.workers is not None:
-        requested_workers = max(1, int(args.workers))
-    else:
-        cpu_count = os.cpu_count() or 1
+    cpu_count = os.cpu_count() or 1
+    workers_setting = args.workers
+
+    if workers_setting == "auto":
         requested_workers = max(1, min(8, cpu_count))
         if cpu_count > requested_workers:
             print(
@@ -270,7 +324,21 @@ def main():
                 f"{requested_workers} (CPU count: {cpu_count}). "
                 "Use --workers to override if resources allow."
             )
-    max_workers = min(requested_workers, len(base_tasks))
+    elif workers_setting == "cpu":
+        requested_workers = max(1, cpu_count)
+    elif workers_setting == "mc":
+        requested_workers = max(1, args.mc_runs)
+    elif workers_setting == "tasks":
+        requested_workers = max(1, len(base_tasks))
+    else:
+        requested_workers = int(workers_setting)
+
+    max_workers = max(1, min(requested_workers, len(base_tasks)))
+    if requested_workers > len(base_tasks):
+        print(
+            "[Parallel] Requested workers exceed available tasks; using "
+            f"{max_workers} workers for {len(base_tasks)} tasks."
+        )
     print(f"[Parallel] Using up to {max_workers} workers for {len(base_tasks)} tasks per run (m-values x restarts)")
 
     # Select which Monte Carlo run should output detailed per-iteration plots
