@@ -18,6 +18,9 @@ import os
 import sys
 import argparse
 import numpy as np
+import concurrent.futures as _fut
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as _mp
 import pandas as pd
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -33,6 +36,66 @@ from model import (
     onehot_from_index, index_to_action, QNetwork, DDQNAgent, estimate_bandwidth_vector_RL,
     train_RL_agent, centers_from_membership, kdml_fcm
 )
+
+# -------------------------
+# Worker process context
+# -------------------------
+_CTX = {
+    'X': None,
+    'C': None,
+    'con_idx': None,
+    'fac_idx': None,
+    'ord_idx': None,
+    'U_init': None,
+    'U_true': None,
+    'epsilon': None,
+    'max_iter_obj': None,
+    'agent': None,
+}
+
+
+def _worker_init(X, C, con_idx, fac_idx, ord_idx, U_init, U_true, epsilon, max_iter_obj, agent_path):
+    # Initialize heavy globals once per process
+    _CTX['X'] = X
+    _CTX['C'] = C
+    _CTX['con_idx'] = con_idx
+    _CTX['fac_idx'] = fac_idx
+    _CTX['ord_idx'] = ord_idx
+    _CTX['U_init'] = U_init
+    _CTX['U_true'] = U_true
+    _CTX['epsilon'] = epsilon
+    _CTX['max_iter_obj'] = max_iter_obj
+    # Load agent on CPU to avoid GPU contention across processes
+    device = torch.device('cpu')
+    agent = DDQNAgent(lr=1e-3, gamma=0.9, epsilon=1.0, device=device)
+    agent.load(agent_path)
+    _CTX['agent'] = agent
+
+
+def _run_single_restart(task):
+    # task: (m_value, restart_index)
+    m_val, _ = task
+    X = _CTX['X']; C = _CTX['C']
+    con_idx = _CTX['con_idx']; fac_idx = _CTX['fac_idx']; ord_idx = _CTX['ord_idx']
+    U_init = _CTX['U_init']; U_true = _CTX['U_true']
+    epsilon = _CTX['epsilon']; max_iter_obj = _CTX['max_iter_obj']
+    agent = _CTX['agent']
+
+    V, U, reward_history, bw_final, U_history = kdml_fcm(
+        X=X, C=C, m=m_val, epsilon=epsilon,
+        con_idx=con_idx, fac_idx=fac_idx, ord_idx=ord_idx,
+        U_init=U_init, max_iter=100, verbose=False,
+        RL_agent=agent, train_B=0, max_iter_obj=max_iter_obj, ckpt_dir="./checkpoints",
+        show_fcm_progress=False
+    )
+    fari_score = fari(U, U_true)
+    iter_fari = []
+    for t in range(1, len(U_history)):
+        prev_U = U_history[t-1]
+        cur_U = U_history[t]
+        iter_fari.append(fari(prev_U, cur_U))
+    # Return minimal data to main proc
+    return (float(m_val), float(fari_score), iter_fari)
 
 # -------------------------
 # Inference-only DDQN agent
@@ -112,6 +175,7 @@ def main():
     parser.add_argument("--outputs_dir", type=str, default="./outputs", help="Output directory")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument("--restarts", type=int, default=10, help="Number of KDSS-FCM restarts per m (keep best by FARI)")
+    parser.add_argument("--workers", type=int, default=None, help="Max worker processes for parallel runs (default: CPU count)")
     
     args = parser.parse_args()
 
@@ -179,36 +243,36 @@ def main():
     print(f"\n=== Grid Search over m parameter ===")
     print(f"Testing m values: {m_values}")
     
-    for m in tqdm(m_values, desc="Testing m values"):
-        # Multiple restarts; keep best by FARI
-        best_fari_m = -np.inf
-        best_U_m = None
-        # per-restart FARI between consecutive iterations (for plotting)
-        per_restart_fari_series = []
-        for r in range(args.restarts):
-            V, U, reward_history, bw_final, U_history = kdml_fcm(
-                X=X, C=C, m=m, epsilon=args.epsilon,
-                con_idx=con_idx, fac_idx=fac_idx, ord_idx=ord_idx,
-                U_init=U_init, max_iter=100, verbose=False,
-                RL_agent=agent, train_B=0, max_iter_obj=args.max_iter_obj, ckpt_dir="./checkpoints",
-                show_fcm_progress=False
-            )
-            fari_score = fari(U, U_true)
-            if fari_score > best_fari_m:
-                best_fari_m = fari_score
-                best_U_m = U
-            # compute FARI between consecutive U's in U_history
-            iter_fari = []
-            for t in range(1, len(U_history)):
-                prev_U = U_history[t-1]
-                cur_U = U_history[t]
-                iter_fari.append(fari(prev_U, cur_U))
-            per_restart_fari_series.append(iter_fari)
+    # Parallel execution over (m, restart) pairs
+    tasks = [(float(m), int(r)) for m in m_values for r in range(args.restarts)]
+    max_workers = args.workers or os.cpu_count() or 1
+    print(f"[Parallel] Initializing {max_workers} workers for {len(tasks)} tasks (m-values x restarts)")
+    results_by_m = {float(m): [] for m in m_values}
+
+    with ProcessPoolExecutor(max_workers=max_workers,
+                             initializer=_worker_init,
+                             initargs=(X, C, con_idx, fac_idx, ord_idx, U_init, U_true, args.epsilon, args.max_iter_obj, args.agent_path)) as ex:
+        futures = {ex.submit(_run_single_restart, t): t for t in tasks}
+        for _ in tqdm(_fut.as_completed(futures), total=len(futures), desc="Parallel runs"):
+            pass
+    # Collect results (iterate futures again to extract results in a deterministic pass)
+    for fut, (m_task, _) in futures.items():
+        m_val, fari_score_val, iter_series = fut.result()
+        results_by_m[m_val].append((fari_score_val, iter_series))
+
+    # Aggregate per-m results, plot, and store FARI scores
+    for m in m_values:
+        m_key = float(m)
+        per_restart = results_by_m[m_key]
+        if not per_restart:
+            fari_scores.append(float('-inf'))
+            continue
+        best_fari_m = max(fr for fr, _ in per_restart)
+        per_restart_fari_series = [series for _, series in per_restart]
         fari_scores.append(best_fari_m)
         if args.verbose:
             print(f"m={m:.2f}: best FARI over {args.restarts} restarts = {best_fari_m:.4f}")
 
-        # Plot per-iteration FARI for each restart (current m)
         fig, ax = plt.subplots(figsize=(10,6))
         for ridx, series in enumerate(per_restart_fari_series):
             ax.plot(range(1, len(series)+1), series, label=f"restart {ridx+1}", alpha=0.7)
