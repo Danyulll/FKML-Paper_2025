@@ -177,6 +177,8 @@ def main():
     parser.add_argument("--restarts", type=int, default=10, help="Number of KDSS-FCM restarts per m (keep best by FARI)")
     parser.add_argument("--workers", type=int, default=None,
         help="Max worker processes for parallel runs (default: 100)")
+    parser.add_argument("--mc_runs", type=int, default=100,
+        help="Number of Monte Carlo repetitions of the entire m-grid search (default: 100)")
     
     args = parser.parse_args()
 
@@ -237,97 +239,117 @@ def main():
     print(f"[DDQN] Loaded trained agent from {args.agent_path}")
     print(f"[DDQN] Using device: {device}")
 
-    # 6) Grid search over m parameter
+    # 6) Grid search over m parameter with Monte Carlo repetitions
     m_values = np.linspace(1.1, 2.0, 10)
-    fari_scores = []
-    
+    all_run_fari_scores = []  # list of lists (per run best FARI per m)
+    best_ms_per_run = []
+    best_faris_per_run = []
+
     print(f"\n=== Grid Search over m parameter ===")
     print(f"Testing m values: {m_values}")
-    
-    # Parallel execution over (m, restart) pairs
-    tasks = [(float(m), int(r)) for m in m_values for r in range(args.restarts)]
+    print(f"Monte Carlo repetitions: {args.mc_runs}")
+
+    # Precompute shared task list
+    base_tasks = [(float(m), int(r)) for m in m_values for r in range(args.restarts)]
+
     # Default to using 100 workers unless explicitly overridden.
     requested_workers = int(max(1, args.workers)) if args.workers is not None else 100
-    max_workers = min(requested_workers, len(tasks))
+    max_workers = min(requested_workers, len(base_tasks))
+    print(f"[Parallel] Using up to {max_workers} workers for {len(base_tasks)} tasks per run (m-values x restarts)")
 
-    print(f"[Parallel] Initializing {max_workers} workers for {len(tasks)} tasks (m-values x restarts)")
-    results_by_m = {float(m): [] for m in m_values}
+    # Select which Monte Carlo run should output detailed per-iteration plots
+    plot_run_index = 0  # zero-based; choose the first run by default
 
-    with ProcessPoolExecutor(
-        max_workers=max_workers,
-        initializer=_worker_init,
-        initargs=(
-            X,
-            C,
-            con_idx,
-            fac_idx,
-            ord_idx,
-            U_init,
-            U_true,
-            args.epsilon,
-            args.max_iter_obj,
-            args.agent_path,
-        ),
-    ) as ex:
-        futures = {ex.submit(_run_single_restart, t): t for t in tasks}
-        for _ in tqdm(_fut.as_completed(futures), total=len(futures), desc="Parallel runs"):
-            pass
-    # Collect results (iterate futures again to extract results in a deterministic pass)
-    for fut, (m_task, _) in futures.items():
-        m_val, fari_score_val, iter_series = fut.result()
-        results_by_m[m_val].append((fari_score_val, iter_series))
+    for run_idx in range(args.mc_runs):
+        run_label = run_idx + 1
+        print(f"\n--- Monte Carlo run {run_label}/{args.mc_runs} ---")
+        results_by_m = {float(m): [] for m in m_values}
 
-    # Aggregate per-m results, plot, and store FARI scores
-    for m in m_values:
-        m_key = float(m)
-        per_restart = results_by_m[m_key]
-        if not per_restart:
-            fari_scores.append(float('-inf'))
-            continue
-        best_fari_m = max(fr for fr, _ in per_restart)
-        per_restart_fari_series = [series for _, series in per_restart]
-        fari_scores.append(best_fari_m)
-        if args.verbose:
-            print(f"m={m:.2f}: best FARI over {args.restarts} restarts = {best_fari_m:.4f}")
+        with ProcessPoolExecutor(
+            max_workers=max_workers,
+            initializer=_worker_init,
+            initargs=(
+                X,
+                C,
+                con_idx,
+                fac_idx,
+                ord_idx,
+                U_init,
+                U_true,
+                args.epsilon,
+                args.max_iter_obj,
+                args.agent_path,
+            ),
+        ) as ex:
+            futures = {ex.submit(_run_single_restart, t): t for t in base_tasks}
+            for _ in tqdm(_fut.as_completed(futures), total=len(futures), desc="Parallel runs"):
+                pass
 
-        fig, ax = plt.subplots(figsize=(10,6))
-        for ridx, series in enumerate(per_restart_fari_series):
-            ax.plot(range(1, len(series)+1), series, label=f"restart {ridx+1}", alpha=0.7)
-        ax.set_title(f"Per-iteration FARI(prev,cur) for m={m:.3f}")
-        ax.set_xlabel("Iteration")
-        ax.set_ylabel("FARI(prev, cur)")
-        ax.grid(True, alpha=0.3)
-        if len(per_restart_fari_series) <= 12:
-            ax.legend()
-        plt.tight_layout()
-        m_dir = os.path.join(args.outputs_dir, f"m_{m:.3f}")
-        ensure_dir(m_dir)
-        plt.savefig(os.path.join(m_dir, "fari_between_iterations.png"), dpi=200, bbox_inches="tight")
-        plt.close(fig)
+        for fut, (m_task, _) in futures.items():
+            m_val, fari_score_val, iter_series = fut.result()
+            results_by_m[m_val].append((fari_score_val, iter_series))
 
-    # 7) Find best m and results
-    best_idx = np.argmax(fari_scores)
+        run_fari_scores = []
+        for m in m_values:
+            m_key = float(m)
+            per_restart = results_by_m[m_key]
+            if not per_restart:
+                run_fari_scores.append(float('-inf'))
+                continue
+            best_fari_m = max(fr for fr, _ in per_restart)
+            run_fari_scores.append(best_fari_m)
+            if args.verbose:
+                print(f"[Run {run_label}] m={m:.2f}: best FARI over {args.restarts} restarts = {best_fari_m:.4f}")
+
+            if run_idx == plot_run_index:
+                per_restart_fari_series = [series for _, series in per_restart]
+                fig, ax = plt.subplots(figsize=(10,6))
+                for ridx, series in enumerate(per_restart_fari_series):
+                    ax.plot(range(1, len(series)+1), series, label=f"restart {ridx+1}", alpha=0.7)
+                ax.set_title(f"Per-iteration FARI(prev,cur) for m={m:.3f} (Run {run_label})")
+                ax.set_xlabel("Iteration")
+                ax.set_ylabel("FARI(prev, cur)")
+                ax.grid(True, alpha=0.3)
+                if len(per_restart_fari_series) <= 12:
+                    ax.legend()
+                plt.tight_layout()
+                m_dir = os.path.join(args.outputs_dir, f"run_{run_label:03d}", f"m_{m:.3f}")
+                ensure_dir(m_dir)
+                plt.savefig(os.path.join(m_dir, "fari_between_iterations.png"), dpi=200, bbox_inches="tight")
+                plt.close(fig)
+
+        all_run_fari_scores.append(run_fari_scores)
+        run_best_idx = int(np.argmax(run_fari_scores))
+        run_best_m = m_values[run_best_idx]
+        run_best_fari = run_fari_scores[run_best_idx]
+        best_ms_per_run.append(float(run_best_m))
+        best_faris_per_run.append(float(run_best_fari))
+        print(f"[Run {run_label}] Best m: {run_best_m:.3f}, Best FARI: {run_best_fari:.4f}")
+
+    fari_scores = np.array(all_run_fari_scores)
+    avg_fari_scores = fari_scores.mean(axis=0)
+    best_idx = int(np.argmax(avg_fari_scores))
     best_m = m_values[best_idx]
-    best_fari = fari_scores[best_idx]
-    
-    print(f"\n=== Results ===")
-    print(f"Best m: {best_m:.3f}")
-    print(f"Best FARI: {best_fari:.4f}")
-    print(f"All FARI scores: {[f'{f:.4f}' for f in fari_scores]}")
+    best_fari = avg_fari_scores[best_idx]
 
-    # 8) Plot FARI vs m
+    print(f"\n=== Monte Carlo Averaged Results ===")
+    print(f"Average best m (by mean FARI): {best_m:.3f}")
+    print(f"Average best FARI: {best_fari:.4f}")
+    print(f"Average FARI scores per m: {[f'{f:.4f}' for f in avg_fari_scores]}")
+
+    # 8) Plot average FARI vs m
     plt.figure(figsize=(10, 6))
-    plt.plot(m_values, fari_scores, 'bo-', linewidth=2, markersize=8)
+    plt.plot(m_values, avg_fari_scores, 'bo-', linewidth=2, markersize=8)
     plt.axvline(x=best_m, color='red', linestyle='--', alpha=0.7, label=f'Best m = {best_m:.3f}')
     plt.axhline(y=best_fari, color='red', linestyle='--', alpha=0.7, label=f'Best FARI = {best_fari:.4f}')
     plt.xlabel('Fuzzifier Parameter (m)')
-    plt.ylabel('FARI Score')
-    plt.title('FARI vs Fuzzifier Parameter (m)')
+    plt.ylabel('Average FARI Score')
+    plt.title('Average FARI vs Fuzzifier Parameter (m)')
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
-    
-    plot_path = os.path.join(args.outputs_dir, "fari_vs_m.png")
+
+    plot_path = os.path.join(args.outputs_dir, "avg_fari_vs_m.png")
     plt.savefig(plot_path, dpi=200, bbox_inches="tight")
     plt.close()
     print(f"Plot saved to: {plot_path}")
@@ -341,12 +363,16 @@ def main():
         f.write(f"Data shape: {X.shape}\n")
         f.write(f"Number of clusters: {C}\n")
         f.write(f"Feature types: con_idx={con_idx}, fac_idx={fac_idx}, ord_idx={ord_idx}\n\n")
-        f.write(f"Best m: {best_m:.6f}\n")
-        f.write(f"Best FARI: {best_fari:.6f}\n\n")
-        f.write("All results:\n")
-        for m, fari_val in zip(m_values, fari_scores):
-            f.write(f"  m={m:.3f}: FARI={fari_val:.6f}\n")
-    
+        f.write(f"Monte Carlo runs: {args.mc_runs}\n")
+        f.write(f"Average best m: {best_m:.6f}\n")
+        f.write(f"Average best FARI: {best_fari:.6f}\n\n")
+        f.write("Average FARI per m:\n")
+        for m, fari_val in zip(m_values, avg_fari_scores):
+            f.write(f"  m={m:.3f}: avg_FARI={fari_val:.6f}\n")
+        f.write("\nPer-run best configurations:\n")
+        for run_idx, (run_m, run_fari) in enumerate(zip(best_ms_per_run, best_faris_per_run), start=1):
+            f.write(f"  Run {run_idx:03d}: best_m={run_m:.6f}, best_FARI={run_fari:.6f}\n")
+
     print(f"Results saved to: {results_path}")
 
 if __name__ == "__main__":
