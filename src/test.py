@@ -306,24 +306,20 @@ def main():
     # Precompute shared task list
     base_tasks = [(float(m), int(r)) for m in m_values for r in range(args.restarts)]
 
-    # Default to a conservative worker count unless explicitly overridden. Using too many
-    # concurrent processes drastically increases memory usage because each worker keeps a
-    # copy of the dataset and DDQN agent in memory.  The previous default of 100 workers
-    # led to out-of-memory crashes on larger Monte Carlo sweeps.  Instead, cap the default
-    # by the CPU count and a small upper bound (8) which keeps memory usage reasonable
-    # while still providing parallelism.  Users can still override this with --workers if
-    # they have sufficient resources.
+    # Default to using all available CPU cores for parallelization.
+    # Note: Each worker keeps a copy of the dataset and DDQN agent in memory,
+    # so using too many workers may increase memory usage. Users can override
+    # this with --workers if they need to limit parallelism.
     cpu_count = os.cpu_count() or 1
+    print(f"\n=== System Information ===")
+    print(f"Available CPU cores: {cpu_count}")
+    print(f"===========================\n")
+    
     workers_setting = args.workers
 
     if workers_setting == "auto":
-        requested_workers = max(1, min(8, cpu_count))
-        if cpu_count > requested_workers:
-            print(
-                "[Parallel] Limiting default workers to "
-                f"{requested_workers} (CPU count: {cpu_count}). "
-                "Use --workers to override if resources allow."
-            )
+        requested_workers = max(1, cpu_count)
+        print(f"[Parallel] Using all {requested_workers} CPU cores (auto mode)")
     elif workers_setting == "cpu":
         requested_workers = max(1, cpu_count)
     elif workers_setting == "mc":

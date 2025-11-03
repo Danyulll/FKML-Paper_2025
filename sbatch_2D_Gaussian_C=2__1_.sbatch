@@ -1,11 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=2D-Gaussian-C-2-(1)
 #SBATCH --account=def-thompsjr   # <-- change this
-#SBATCH --time=48:00:00
+#SBATCH --time=72:00:00
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=1                 # or --gpus-per-node=v100:1 / a100:1 if you need a type
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=8G
+#SBATCH --cpus-per-task=100
+#SBATCH --mem=64G
 #SBATCH --output=%x-%j.out
 
 set -euo pipefail
