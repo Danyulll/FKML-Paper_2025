@@ -3,7 +3,6 @@
 #SBATCH --account=def-thompsjr   # <-- change this
 #SBATCH --time=168:00:00
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=1                 # or --gpus-per-node=v100:1 / a100:1 if you need a type
 #SBATCH --cpus-per-task=100
 #SBATCH --mem=400G
 #SBATCH --output=%x-%j.out
